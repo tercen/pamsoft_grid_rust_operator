@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+' # Push events to any matching semantic tag
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+    - name: VERSION
+      run: |
+        echo "TAG=${GITHUB_REF##*/}" >> $GITHUB_ENV
+        echo "DOCKER_IMAGE=pamgene/${{ github.event.repository.name }}" >> $GITHUB_ENV
+    - name: Update container in operator JSON
+      # Rewrite `container` in operator.json from `pamgene/...:latest` to
+      # the tagged image so Tercen pulls the versioned image, not :latest.
+      # The original `jq … operator.json` (no redirect) printed to stdout
+      # and left the file untouched, releasing :latest-pinned images
+      # regardless of the tag — fixed by writing to a temp file + mv.
+      run: |
+        jq --arg variable "$DOCKER_IMAGE:$TAG" '.container = $variable' operator.json > operator.json.tmp
+        mv operator.json.tmp operator.json
+        echo "operator.json container field is now:"
+        jq -r '.container' operator.json
+    - name: Build docker image
+      env:
+        GH_PAT: ${{ secrets.GH_PAT }}
+      run: |
+        DOCKER_BUILDKIT=1 docker build \
+          --secret id=gh_pat,env=GH_PAT \
+          -f Dockerfile \
+          -t $DOCKER_IMAGE:$TAG .
+    - name: docker login
+      run: |
+        docker login --username ${{ secrets.DOCKER_HUB_USERNAME }} --password ${{ secrets.DOCKER_HUB_PASSWORD }}
+    - name: docker push
+      run: |
+        docker push $DOCKER_IMAGE:$TAG
+        docker tag $DOCKER_IMAGE:$TAG $DOCKER_IMAGE:latest
+        docker push $DOCKER_IMAGE:latest
+    # Integration test against a live Tercen instance. Disabled while the
+    # operator is still stubs; re-enable once the repo is public or a PAT
+    # with read access is wired as TERCEN_GITHUB_TOKEN.
+    - name: Pull tercenctl
+      if: false
+      run: docker pull tercen/tercenctl:release
+    - name: Install operator
+      if: false
+      run: |
+        docker run --rm \
+          -e TERCEN_USERNAME=${{ secrets.TERCEN_TEST_OPERATOR_USERNAME }} \
+          -e TERCEN_PASSWORD=${{ secrets.TERCEN_TEST_OPERATOR_PASSWORD }} \
+          -e TERCEN_URI=${{ secrets.TERCEN_TEST_OPERATOR_URI }} \
+          -e GITHUB_TOKEN=${{ secrets.TERCEN_GITHUB_TOKEN }} \
+          tercen/tercenctl:release operator install --rm --tag ${TAG} --repo ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+    - name: Create required package.json
+      run: echo '{}' > package.json
+    - name: Build changelog
+      id: Changelog
+      uses: tercen/generate-changelog-action@master
+    - name: Create release
+      id: create_release
+      uses: actions/create-release@latest
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        body: ${{steps.Changelog.outputs.changelog}}
+        draft: false
+        prerelease: false

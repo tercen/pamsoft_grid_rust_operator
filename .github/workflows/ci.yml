@@ -1,0 +1,83 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the action will run. Triggers the workflow on push or pull request
+# events but only for the main branch
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  build-docker:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
+      - name: TERCEN_VERSION
+        run: |
+          echo "TERCEN_VERSION=${GITHUB_REF##*/}" >> $GITHUB_ENV
+      - name: SEMVER TERCEN_VERSION
+        run: |
+          SEMVER=( ${TERCEN_VERSION//./ } )
+          echo "TERCEN_MAJOR=${SEMVER[0]}" >> $GITHUB_ENV
+          echo "TERCEN_MINOR=${SEMVER[1]}" >> $GITHUB_ENV
+          echo "TERCEN_PATCH=${SEMVER[2]}" >> $GITHUB_ENV
+      - name: COMMIT_NUMBER
+        run: |
+          echo "COMMIT_NUMBER=${GITHUB_SHA::8}" >> $GITHUB_ENV
+      - name: docker login
+        run: docker login --username ${{ secrets.DOCKER_HUB_USERNAME }} --password ${{ secrets.DOCKER_HUB_PASSWORD }}
+      - name: docker build
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            --secret id=gh_pat,env=GH_PAT \
+            -f Dockerfile \
+            -t pamgene/pamsoft_grid_rust_operator .
+      - name: docker tag/push COMMIT_NUMBER
+        run: |
+          docker tag pamgene/pamsoft_grid_rust_operator pamgene/pamsoft_grid_rust_operator:${COMMIT_NUMBER}
+          docker push pamgene/pamsoft_grid_rust_operator:${COMMIT_NUMBER}
+      - name: docker tag/push latest
+        run: |
+          docker tag pamgene/pamsoft_grid_rust_operator pamgene/pamsoft_grid_rust_operator:latest
+          docker push pamgene/pamsoft_grid_rust_operator:latest
+        if: env.TERCEN_VERSION == 'main'
+      - name: docker minor tag version
+        run: |
+          docker tag pamgene/pamsoft_grid_rust_operator pamgene/pamsoft_grid_rust_operator:${TERCEN_MAJOR}
+          docker push pamgene/pamsoft_grid_rust_operator:${TERCEN_MAJOR}
+          docker tag pamgene/pamsoft_grid_rust_operator pamgene/pamsoft_grid_rust_operator:${TERCEN_MAJOR}.${TERCEN_MINOR}
+          docker push pamgene/pamsoft_grid_rust_operator:${TERCEN_MAJOR}.${TERCEN_MINOR}
+          docker tag pamgene/pamsoft_grid_rust_operator pamgene/pamsoft_grid_rust_operator:${TERCEN_MAJOR}.${TERCEN_MINOR}.${TERCEN_PATCH}
+          docker push pamgene/pamsoft_grid_rust_operator:${TERCEN_MAJOR}.${TERCEN_MINOR}.${TERCEN_PATCH}
+        if: env.TERCEN_PATCH != ''
+
+  # Integration test against a live Tercen instance. Disabled while the
+  # operator is still stubs — tercenctl can't download a private repo
+  # without the TERCEN_GITHUB_TOKEN secret anyway. Re-enable by removing
+  # `if: false` once the repo is public or a PAT with read access is set.
+  build:
+    if: false
+    needs: build-docker
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Pull tercenctl
+      run: docker pull tercen/tercenctl:release
+    - name: Install operator
+      run: |
+        docker run --rm \
+          -e TERCEN_USERNAME=${{ secrets.TERCEN_TEST_OPERATOR_USERNAME }} \
+          -e TERCEN_PASSWORD=${{ secrets.TERCEN_TEST_OPERATOR_PASSWORD }} \
+          -e TERCEN_URI=${{ secrets.TERCEN_TEST_OPERATOR_URI }} \
+          -e GITHUB_TOKEN=${{ secrets.TERCEN_GITHUB_TOKEN }} \
+          tercen/tercenctl:release operator install --rm --tag ${GITHUB_SHA} --repo ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}

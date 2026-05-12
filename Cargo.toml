@@ -1,0 +1,57 @@
+[package]
+name = "pamsoft_grid_operator"
+version = "0.1.0"
+edition = "2021"
+authors = ["Tercen", "Thiago"]
+
+[lib]
+name = "pamsoft_grid_operator"
+path = "src/lib.rs"
+
+# Production binary invoked by Tercen (--taskId / --serviceUri / --token).
+[[bin]]
+name = "pamsoft_grid_operator"
+path = "src/main.rs"
+
+# Local development binary reading TERCEN_* env vars instead of CLI args.
+[[bin]]
+name = "dev"
+path = "src/bin/dev.rs"
+
+[dependencies]
+# Tercen gRPC SDK: client, context, property reading, table upload.
+# Pulls in tonic/prost/polars/tokio transitively.
+tercen-rs = { git = "https://github.com/tercen/tercen-rs", branch = "main" }
+
+# Async runtime (tokio macros for #[tokio::main]).
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time"] }
+
+# Image-processing algorithm (used in upcoming chunks, not yet).
+pamsoft_grid = { git = "https://github.com/tercen/pamsoft_grid_rust.git", branch = "main" }
+
+# Error handling + logging.
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# operator.json is embedded at compile time and parsed for property
+# defaults (see src/props.rs). Mirrors the ggrs_plot_operator pattern.
+serde_json = "1.0"
+
+# Columnar input/output. tercen-rs ships polars transitively but we use
+# it directly for input-table parsing and result DataFrame construction.
+polars = { version = "0.51", features = ["lazy", "dtype-full"] }
+
+# Image ZIPs (Tercen documentId column) are .zip archives — we
+# stream-download then extract via the same approach bulk_regression
+# already uses. tercen-rs doesn't expose this transitively.
+zip = "0.6"
+
+# gRPC types for FileService request/response (server streaming download).
+tonic = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

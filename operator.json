@@ -1,0 +1,100 @@
+{
+  "name": "pamsoft_grid_rust_operator",
+  "description": "PamSoft grid detection + segmentation operator. Rust port of the original MATLAB MCR implementation.",
+  "tags": ["image analysis"],
+  "communicationProtocol": "grpc",
+  "authors": ["Tercen", "Thiago"],
+  "urls": ["https://github.com/tercen/pamsoft_grid_rust_operator"],
+  "container": "pamgene/pamsoft_grid_rust_operator:latest",
+  "properties": [
+    {
+      "kind": "DoubleProperty",
+      "name": "Min Diameter",
+      "defaultValue": 0.45,
+      "description": "Lower bound for the segmented spot diameter, as a fraction of grdSpotPitch.",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "Max Diameter",
+      "defaultValue": 0.85,
+      "description": "Upper bound for the segmented spot diameter, as a fraction of grdSpotPitch.",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "Saturation Limit",
+      "defaultValue": 4095,
+      "description": "Pixel intensity above which a pixel is considered saturated.",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "Spot Pitch",
+      "defaultValue": 0,
+      "description": "Distance between adjacent spots in pixels. 0 = auto-detect from image dimensions (17 for Evolve3, 21.5 for Evolve2).",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "Edge Sensitivity",
+      "defaultValue": 0.01,
+      "description": "Canny edge high threshold (fractional). Low threshold is fixed at 0.",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
+      "name": "Spot Size",
+      "defaultValue": 0.66,
+      "description": "Spot radius as a fraction of grdSpotPitch.",
+      "values": {}
+    },
+    {
+      "kind": "EnumeratedProperty",
+      "name": "Segmentation Method",
+      "defaultValue": "Edge",
+      "description": "Per-spot segmentation algorithm.",
+      "values": ["Edge", "Hough"]
+    },
+    {
+      "kind": "StringProperty",
+      "name": "Rotation",
+      "defaultValue": "-2:0.25:2",
+      "description": "Template rotation candidates in MATLAB seq() syntax 'min:step:max' (e.g. -2:0.25:2). A single value triggers MATLAB's imregister2 path which is known to hallucinate large rotations — use a vector for production parity.",
+      "values": {}
+    }
+  ],
+  "operatorSpec": {
+    "kind": "OperatorSpec",
+    "ontologyUri": "https://tercen.com/_ontology/tercen",
+    "ontologyVersion": "0.0.1",
+    "inputSpecs": [
+      {
+        "kind": "CrosstabSpec",
+        "metaFactors": [
+          {
+            "kind": "MetaFactor",
+            "name": "Documents",
+            "type": "",
+            "description": "documentId column(s) referencing the input file(s): the image ZIP (and optionally the array-layout text file as a second documentId). 1 or 2 columns.",
+            "ontologyMapping": "documentId",
+            "crosstabMapping": "column",
+            "cardinality": "1..2",
+            "factors": []
+          },
+          {
+            "kind": "MetaFactor",
+            "name": "Image",
+            "type": "",
+            "description": "Filename stem (no extension) of each image inside the ZIP. One row per image; rows sharing a .ci form a chip group.",
+            "ontologyMapping": "sample",
+            "crosstabMapping": "column",
+            "cardinality": "1..n",
+            "factors": []
+          }
+        ]
+      }
+    ],
+    "outputSpecs": []
+  }
+}

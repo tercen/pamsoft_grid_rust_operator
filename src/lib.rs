@@ -1,0 +1,162 @@
+//! pamsoft_grid_operator — Tercen operator for peptide microarray gridding.
+//!
+//! The crate exposes a single entry point, [`run`], shared between the
+//! production binary (`src/main.rs`, invoked by Tercen with `--taskId` /
+//! `--serviceUri` / `--token`) and the dev binary (`src/bin/dev.rs`, driven
+//! by `TERCEN_*` environment variables).
+//!
+//! At this stage the function only connects to Tercen and prints task
+//! metadata — input-data download, algorithm execution and result upload
+//! land in later chunks.
+
+pub mod algorithm;
+pub mod download;
+pub mod input;
+pub mod props;
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use tercen_rs::context::ContextBase;
+use tercen_rs::{DevContext, ProductionContext, TercenClient};
+
+/// Production entry point. Bootstraps a `ProductionContext` from a
+/// task ID (the Tercen platform passes this in via `--taskId`), then
+/// hands off to [`execute`] for the actual operator pipeline.
+///
+/// `TERCEN_URI` and `TERCEN_TOKEN` must already be in the environment —
+/// the production binary (`src/main.rs`) extracts them from CLI args
+/// before calling this; the dev binary doesn't go through this function.
+pub async fn run(task_id: &str) -> Result<()> {
+    tracing::info!("pamsoft_grid_operator starting (task_id={task_id})");
+    let client = build_client().await?;
+    let ctx = ProductionContext::from_task_id(client, task_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("load task {task_id}: {e}"))?;
+    execute(&ctx).await
+}
+
+/// Dev entry point. Bootstraps a `DevContext` from a workflow/step
+/// pair (no Tercen-side task needed — useful for running the operator
+/// locally against a workflow you're authoring), then hands off to
+/// [`execute`].
+///
+/// Same `TERCEN_URI` / `TERCEN_TOKEN` requirement as [`run`].
+pub async fn run_dev(workflow_id: &str, step_id: &str) -> Result<()> {
+    tracing::info!(
+        "pamsoft_grid_operator starting in dev mode \
+         (workflow_id={workflow_id}, step_id={step_id})"
+    );
+    let client = build_client().await?;
+    let ctx = DevContext::from_workflow_step(client, workflow_id, step_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("load workflow {workflow_id} / step {step_id}: {e}"))?;
+    execute(&ctx).await
+}
+
+async fn build_client() -> Result<Arc<TercenClient>> {
+    let client = TercenClient::from_env()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect to Tercen: {e}"))?;
+    tracing::info!("connected to Tercen");
+    Ok(Arc::new(client))
+}
+
+/// Pipeline implementation, generic over the context flavour (taking
+/// the concrete `&ContextBase` since `ProductionContext` and
+/// `DevContext` both `Deref<Target = ContextBase>`).
+///
+/// Currently only handles stages 1-3 of the operator port: bootstrap,
+/// property parsing, input-table reading. Stages 4-7 (file download,
+/// algorithm invocation, result-table construction, upload) land in
+/// subsequent commits.
+async fn execute(ctx: &ContextBase) -> Result<()> {
+    tracing::info!(
+        workflow = ctx.workflow_id(),
+        step = ctx.step_id(),
+        project = ctx.project_id(),
+        namespace = ctx.namespace(),
+        "context loaded"
+    );
+
+    let pamsoft_props = props::read_pamsoft_props(ctx.operator_settings())
+        .map_err(|e| anyhow::anyhow!("read operator properties: {e}"))?;
+    tracing::info!(
+        min_diameter = pamsoft_props.min_diameter,
+        max_diameter = pamsoft_props.max_diameter,
+        spot_pitch = pamsoft_props.spot_pitch,
+        spot_size = pamsoft_props.spot_size,
+        rotation_n = pamsoft_props.rotation.len(),
+        saturation_limit = pamsoft_props.saturation_limit,
+        edge_high = pamsoft_props.edge_sensitivity[1],
+        seg_method = pamsoft_props.seg_method,
+        "operator properties parsed"
+    );
+
+    let input_data = input::load_input_data(ctx)
+        .await
+        .map_err(|e| anyhow::anyhow!("load input table: {e:#}"))?;
+    tracing::info!(
+        n_groups = input_data.n_groups(),
+        n_rows = input_data.n_rows(),
+        doc_id_cols = ?input_data.document_id_columns,
+        label_col = input_data.label_column,
+        "input table loaded"
+    );
+
+    // Stage 4: download every documentId referenced by the input,
+    // extract ZIPs, locate TIFFs + layout per group. Temp dir is
+    // task-scoped — Tercen task containers are ephemeral so cleanup
+    // happens on container exit; we still RemoveOnDrop it in case the
+    // operator is rerun in the same container (dev mode).
+    let task_id = ctx.workflow_id().to_string() + "_" + ctx.step_id();
+    let work_root = std::env::temp_dir().join(format!("pamsoft_op_{}", task_id));
+    let _drop_guard = TempDirGuard(work_root.clone());
+    let groups = download::download_all_groups(ctx, &input_data, &work_root)
+        .await
+        .map_err(|e| anyhow::anyhow!("file download: {e:#}"))?;
+    tracing::info!(
+        n_groups = groups.len(),
+        work_root = %work_root.display(),
+        "input files ready on disk"
+    );
+
+    // Stage 5: run the grid algorithm per group.
+    let group_results = algorithm::run_grid_per_group(&groups, &pamsoft_props)
+        .map_err(|e| anyhow::anyhow!("grid algorithm: {e:#}"))?;
+    let total_spots: usize = group_results.iter().map(|g| g.spots.len()).sum();
+    tracing::info!(
+        n_groups = group_results.len(),
+        total_spots,
+        "grid algorithm complete — stages 6-7 (result table + upload) not wired yet"
+    );
+
+    Ok(())
+}
+
+/// Best-effort temp-dir cleanup on `run` / `run_dev` exit. Tercen tasks
+/// run in ephemeral containers so a leak here is harmless, but in dev
+/// mode the same WSL machine sees many runs — clean up so /tmp doesn't
+/// balloon.
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Initialise tracing once — called by both binaries.
+pub fn init_tracing() {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .init();
+}
+
+/// Require an environment variable to be set; return a helpful error otherwise.
+pub fn require_env(name: &str) -> Result<String> {
+    std::env::var(name).with_context(|| format!("{name} environment variable not set"))
+}
