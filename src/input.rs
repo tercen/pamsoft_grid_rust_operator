@@ -1,23 +1,23 @@
 //! Input table reading for the pamsoft_grid operator.
 //!
-//! The operator's input is a Tercen crosstab where each column facet
-//! represents one image file in a chip group:
+//! The operator's input is a Tercen crosstab whose **column factor**
+//! carries:
 //!
-//!   * `.ci` — the column-facet index, used to **group images into chips**.
-//!     One unique `.ci` per chip; multiple rows per `.ci` for multi-image
-//!     chips. Mirrors the R operator's `groups <- unique(df$.ci)` step.
-//!   * One or more `documentId`-typed columns on the column-facet table,
-//!     each holding the Tercen document ID of the image ZIP (and
-//!     optionally the layout file). The R operator allows 1 or 2 doc-ID
-//!     columns (`main.R:190-194`); we follow the same rule.
-//!   * One label factor (`ctx.labels()[0]`) — the per-row image
-//!     **filename stem**. Combined with the doc-ID column's path, this
-//!     identifies which TIFF inside the ZIP each row references.
+//!   * One or more `documentId`-typed factors — Tercen document IDs of
+//!     the image ZIP (and optionally the layout file). 1 or 2, matching
+//!     the R operator's contract.
+//!   * One label factor — the per-image **filename stem** (the
+//!     `ctx$labels[[1]]` the R operator uses).
 //!
-//! `load_input_data` streams the column-facet table once via the
-//! tercen-rs `TableStreamer`, parses the TSON payload into a Polars
-//! DataFrame, and groups the rows by `.ci`. The returned
-//! [`InputData`] structure is what stage 4 (file download) consumes.
+//! Each row of the column-facet table is one column in the crosstab —
+//! one image. Rows sharing a `documentId` belong to the same chip
+//! (same ZIP), so we **group rows by their primary documentId** to
+//! form chip groups for the algorithm. The original R operator groups
+//! by `.ci`; that only works on the main data table, where `.ci`
+//! is the column index. The column-facet table itself has no `.ci`
+//! column — it's positional (row 0 → .ci=0, row 1 → .ci=1, …) — and
+//! grouping by documentId is the semantically equivalent way to
+//! reconstruct chips from this side of the join.
 
 use anyhow::{anyhow, bail, Context, Result};
 use polars::prelude::*;
@@ -28,7 +28,10 @@ use tercen_rs::tson_to_dataframe;
 /// One image-row of the operator's input table, decoded into native Rust types.
 #[derive(Debug, Clone)]
 pub struct InputRow {
-    /// Column-facet index — used as the grouping key (chip = one unique `.ci`).
+    /// Implicit `.ci` for this row — the row index in the column-facet
+    /// table (which equals the crosstab column index). Carried through
+    /// so stage 6 (result table construction) can tag each output spot
+    /// back to its source column.
     pub ci: i32,
     /// Filename stem of this image, taken from the first label factor.
     pub image_label: String,
@@ -41,12 +44,15 @@ pub struct InputRow {
 }
 
 /// All rows from the input table, plus the schema introspection we
-/// did along the way (doc-ID column names + label factor name). The
-/// rows are pre-grouped by `.ci`; iteration order is `.ci`-ascending.
+/// did along the way (doc-ID column names + label factor name). Rows
+/// are grouped by their primary documentId — one chip = one image ZIP
+/// doc-id — so iteration over `groups` walks chip-by-chip.
 #[derive(Debug, Clone)]
 pub struct InputData {
-    /// `.ci` → ordered list of rows with that `.ci`.
-    pub groups: BTreeMap<i32, Vec<InputRow>>,
+    /// primary documentId (the image ZIP) → ordered list of rows
+    /// referencing that ZIP. Order within a group preserves the
+    /// column-facet row order (so `.ci`s within a group are ascending).
+    pub groups: BTreeMap<String, Vec<InputRow>>,
     /// Names of the documentId columns we found in the schema, in
     /// schema order. `len()` is always 1 or 2.
     pub document_id_columns: Vec<String>,
@@ -134,9 +140,11 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         .clone();
 
     // Stream the whole column-facet table, restricted to the columns
-    // we actually need. `.ci` is implicit (tercen tables carry it
-    // automatically); doc-ID + label are explicit.
-    let mut cols = vec![".ci".to_string(), label_column.clone()];
+    // we actually need. We do NOT request `.ci` — that column lives on
+    // the main data table (qt_hash), not on the column-facet table.
+    // The crosstab column index for row N of the column-facet table is
+    // simply N (positional convention).
+    let mut cols = vec![label_column.clone()];
     cols.extend(document_id_columns.iter().cloned());
 
     let streamer = ctx.streamer();
@@ -147,11 +155,6 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     let df = tson_to_dataframe(&tson).context("parse TSON column-facet payload")?;
 
     // Pull the columns we need out of the DataFrame.
-    let ci_col = df
-        .column(".ci")
-        .map_err(|e| anyhow!("missing '.ci' column in column-facet TSON: {e}"))?
-        .cast(&DataType::Int32)
-        .context("cast .ci to i32")?;
     let label_col = df
         .column(&label_column)
         .map_err(|e| anyhow!("missing label column '{}': {}", label_column, e))?
@@ -167,25 +170,24 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let ci_series = ci_col.i32().context("ci is not i32")?;
     let label_series = label_col.str().context("label is not string")?;
     let doc_series: Vec<&StringChunked> = doc_cols
         .iter()
         .map(|s| s.str().context("documentId is not string"))
         .collect::<Result<Vec<_>>>()?;
 
-    let n = ci_series.len();
+    let n = label_series.len();
     if n == 0 {
         bail!(
             "column-facet table is empty — no images to process. Check the \
              workflow's input step produces at least one row."
         );
     }
-    let mut groups: BTreeMap<i32, Vec<InputRow>> = BTreeMap::new();
+    // Group by the primary documentId (the image ZIP). Rows referring
+    // to the same ZIP are by definition images from the same chip.
+    let mut groups: BTreeMap<String, Vec<InputRow>> = BTreeMap::new();
     for row_idx in 0..n {
-        let ci = ci_series
-            .get(row_idx)
-            .ok_or_else(|| anyhow!("null .ci at row {row_idx}"))?;
+        let ci = row_idx as i32;
         let image_label = label_series
             .get(row_idx)
             .ok_or_else(|| anyhow!("null label at row {row_idx}"))?
@@ -198,7 +200,8 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
                     .map(String::from)
             })
             .collect::<Result<Vec<_>>>()?;
-        groups.entry(ci).or_default().push(InputRow {
+        let group_key = document_ids[0].clone();
+        groups.entry(group_key).or_default().push(InputRow {
             ci,
             image_label,
             document_ids,

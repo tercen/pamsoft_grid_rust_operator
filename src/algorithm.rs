@@ -18,10 +18,15 @@ use pamsoft_grid::types::{GroupConfig, ImageType, SpotResult};
 use crate::download::GroupFiles;
 use crate::props::PamsoftProps;
 
-/// One group's grid-detection output, tagged with its `.ci` so stage 6
-/// can correctly stitch the result table rows back together.
+/// One group's grid-detection output, tagged with its primary
+/// documentId and the per-image `.ci`s so stage 6 can stitch the
+/// result table rows back together (one row per spot × per image).
 pub struct GroupResult {
-    pub ci: i32,
+    /// Primary documentId (the image ZIP) — the chip group's key.
+    pub doc_id: String,
+    /// Per-image `.ci` values, parallel to the images that produced
+    /// the spots. One entry per image in this group.
+    pub cis: Vec<i32>,
     pub spots: Vec<SpotResult>,
     /// Effective spot pitch used (after auto-detection if the user left
     /// `Spot Pitch = 0`). Surfaced for logging / debugging.
@@ -29,13 +34,13 @@ pub struct GroupResult {
 }
 
 /// Run the grid algorithm on every chip group. Returns one
-/// `GroupResult` per `.ci` in input order.
+/// `GroupResult` per documentId in input order.
 pub fn run_grid_per_group(
-    groups: &std::collections::BTreeMap<i32, GroupFiles>,
+    groups: &std::collections::BTreeMap<String, GroupFiles>,
     props: &PamsoftProps,
 ) -> Result<Vec<GroupResult>> {
     let mut out = Vec::with_capacity(groups.len());
-    for (ci, files) in groups {
+    for (doc_id, files) in groups {
         let spot_pitch = if props.spot_pitch > 0.0 {
             props.spot_pitch
         } else {
@@ -44,11 +49,11 @@ pub fn run_grid_per_group(
             // (aux_functions.R:148-156). 552×413 → 17.0 (Evolve3),
             // 697×520 → 21.5 (Evolve2). Anything else errors loud.
             autodetect_spot_pitch(&files.image_paths[0])
-                .with_context(|| format!(".ci={ci}: auto-detect spot pitch"))?
+                .with_context(|| format!("doc_id={doc_id}: auto-detect spot pitch"))?
         };
 
         let group = GroupConfig {
-            group_id: format!("ci_{ci}"),
+            group_id: doc_id.clone(),
             min_diameter: props.min_diameter,
             max_diameter: props.max_diameter,
             edge_sensitivity: props.edge_sensitivity.to_vec(),
@@ -77,7 +82,7 @@ pub fn run_grid_per_group(
         };
 
         tracing::info!(
-            ci = *ci,
+            doc_id = %doc_id,
             n_images = group.images_list.len(),
             spot_pitch,
             rotation_n = group.rotation.len(),
@@ -85,17 +90,18 @@ pub fn run_grid_per_group(
         );
         let started = std::time::Instant::now();
         let spots = process_single_group(&group)
-            .map_err(|e| anyhow!(".ci={ci} grid pipeline: {e}"))?;
+            .map_err(|e| anyhow!("doc_id={doc_id} grid pipeline: {e}"))?;
         let elapsed = started.elapsed();
         tracing::info!(
-            ci = *ci,
+            doc_id = %doc_id,
             n_spots = spots.len(),
             elapsed_ms = elapsed.as_millis(),
             "chip group done"
         );
 
         out.push(GroupResult {
-            ci: *ci,
+            doc_id: doc_id.clone(),
+            cis: files.cis.clone(),
             spots,
             spot_pitch,
         });

@@ -1,11 +1,12 @@
 //! Stage 4: file download + ZIP extraction.
 //!
-//! For each `.ci` group in [`crate::input::InputData`], we fetch every
-//! unique `documentId` it references via tercen-rs' `FileService.download`
-//! streaming RPC, unzip into a per-group dir under the temp root, and
-//! locate the TIFFs + array-layout file. The output is a
-//! `BTreeMap<i32, GroupFiles>` keyed by `.ci` — exactly the shape stage 5
-//! (algorithm invocation) wants.
+//! For each chip group (keyed by primary documentId) in
+//! [`crate::input::InputData`], we fetch every unique `documentId` it
+//! references via tercen-rs' `FileService.download` streaming RPC,
+//! unzip into a per-group dir under the temp root, and locate the
+//! TIFFs + array-layout file. The output is a
+//! `BTreeMap<String, GroupFiles>` keyed by primary documentId — exactly
+//! the shape stage 5 (algorithm invocation) wants.
 //!
 //! Mirrors `aux_functions.R::prep_image_folder`'s contract:
 //! - The first documentId is the **image ZIP**.
@@ -36,9 +37,15 @@ use crate::input::InputData;
 /// per entry.
 #[derive(Debug, Clone)]
 pub struct GroupFiles {
-    pub ci: i32,
-    /// Absolute paths to the TIFFs for this group, ordered by their
-    /// input-row appearance (so `.ci` ordering is preserved).
+    /// Primary documentId for this chip group — the image ZIP's id.
+    /// Identifies the group and matches the key in the `BTreeMap`
+    /// returned by [`download_all_groups`].
+    pub doc_id: String,
+    /// `.ci` values of the rows that make up this group (one per image).
+    /// Same order as `image_paths`; stage 6 uses these to tag output spots.
+    pub cis: Vec<i32>,
+    /// Absolute paths to the TIFFs for this group, in column-facet row
+    /// order (matches `cis`).
     pub image_paths: Vec<PathBuf>,
     /// Absolute path to the `* Array Layout*.txt` file — either supplied
     /// as a separate documentId or located inside the image ZIP.
@@ -54,7 +61,7 @@ pub async fn download_all_groups(
     ctx: &ContextBase,
     input: &InputData,
     work_root: &Path,
-) -> Result<BTreeMap<i32, GroupFiles>> {
+) -> Result<BTreeMap<String, GroupFiles>> {
     std::fs::create_dir_all(work_root)
         .with_context(|| format!("create work root {}", work_root.display()))?;
 
@@ -78,19 +85,18 @@ pub async fn download_all_groups(
     // Per-group resolution: pick the image files and the layout out of
     // the downloaded docs.
     let mut groups = BTreeMap::new();
-    for (ci, rows) in &input.groups {
+    for (doc_id, rows) in &input.groups {
         // Sanity: every row in a group should reference the same set of
-        // documentIds (they're column-facet column factors — Tercen
-        // enforces this at table construction time, but we verify so
-        // failures are loud).
+        // documentIds (they all share the primary doc_id, but verify
+        // the secondary layout-doc-id agrees too).
         let first_docs = &rows[0].document_ids;
         for r in rows.iter().skip(1) {
             if r.document_ids != *first_docs {
                 bail!(
-                    "rows within .ci={} disagree on documentIds: {:?} vs {:?}. \
-                     Tercen normally enforces a single documentId per column \
-                     factor cell — this indicates a malformed input table.",
-                    ci, first_docs, r.document_ids
+                    "rows within chip group doc_id={} disagree on full \
+                     documentId tuple: {:?} vs {:?}. The primary doc_id matches \
+                     by construction; the secondary (layout) doc_id must too.",
+                    doc_id, first_docs, r.document_ids
                 );
             }
         }
@@ -110,18 +116,21 @@ pub async fn download_all_groups(
         // row's label_factor (filename stem) against `image_root/**/*.tif`.
         let tiff_index = index_tiffs(image_root)?;
         let mut image_paths = Vec::with_capacity(rows.len());
+        let mut cis = Vec::with_capacity(rows.len());
         for row in rows {
             let path = tiff_index.get(&row.image_label).ok_or_else(|| {
                 anyhow!(
-                    ".ci={} row '{}': no TIFF matching that filename stem under {}. \
+                    "chip doc_id={}, row .ci={}, label '{}': no TIFF matching that filename stem under {}. \
                      Available stems: {}",
-                    ci,
+                    doc_id,
+                    row.ci,
                     row.image_label,
                     image_root.display(),
                     tiff_index.keys().take(5).cloned().collect::<Vec<_>>().join(", "),
                 )
             })?;
             image_paths.push(path.clone());
+            cis.push(row.ci);
         }
 
         // Layout: second documentId if present (separate text file),
@@ -156,7 +165,15 @@ pub async fn download_all_groups(
             })?
         };
 
-        groups.insert(*ci, GroupFiles { ci: *ci, image_paths, layout_path });
+        groups.insert(
+            doc_id.clone(),
+            GroupFiles {
+                doc_id: doc_id.clone(),
+                cis,
+                image_paths,
+                layout_path,
+            },
+        );
     }
 
     Ok(groups)
