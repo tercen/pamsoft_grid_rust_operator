@@ -98,33 +98,34 @@ async fn execute(ctx: &ContextBase, task_id: Option<&str>) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("load input table: {e:#}"))?;
     tracing::info!(
-        n_groups = input_data.n_groups(),
-        n_rows = input_data.n_rows(),
+        n_chips = input_data.n_groups(),
         doc_id_cols = ?input_data.document_id_columns,
         label_col = input_data.label_column,
-        "input table loaded"
+        "input table loaded (one chip per .ci)"
     );
 
-    // Stage 4: download every documentId referenced by the input,
-    // extract ZIPs, locate TIFFs + layout per group. Temp dir is
-    // task-scoped — Tercen task containers are ephemeral so cleanup
-    // happens on container exit; we still RemoveOnDrop it in case the
-    // operator is rerun in the same container (dev mode).
+    // Stage 4: download every unique documentId once and index TIFFs by
+    // filename stem. Temp dir is task-scoped — Tercen task containers
+    // are ephemeral so cleanup happens on container exit; we still
+    // RemoveOnDrop it in case the operator is rerun in the same
+    // container (dev mode).
     let work_dir_key = ctx.workflow_id().to_string() + "_" + ctx.step_id();
     let work_root = std::env::temp_dir().join(format!("pamsoft_op_{}", work_dir_key));
     let _drop_guard = TempDirGuard(work_root.clone());
-    let groups = download::download_all_groups(ctx, &input_data, &work_root)
+    let (catalogue, layout_path) = download::download_all(ctx, &input_data, &work_root)
         .await
         .map_err(|e| anyhow::anyhow!("file download: {e:#}"))?;
     tracing::info!(
-        n_groups = groups.len(),
+        n_docs = catalogue.len(),
+        layout = %layout_path.display(),
         work_root = %work_root.display(),
         "input files ready on disk"
     );
 
-    // Stage 5: run the grid algorithm per group.
-    let group_results = algorithm::run_grid_per_group(&groups, &pamsoft_props)
-        .map_err(|e| anyhow::anyhow!("grid algorithm: {e:#}"))?;
+    // Stage 5: run the grid algorithm per .ci (one chip = one image).
+    let group_results =
+        algorithm::run_grid_per_group(&input_data, &catalogue, &layout_path, &pamsoft_props)
+            .map_err(|e| anyhow::anyhow!("grid algorithm: {e:#}"))?;
     let total_spots: usize = group_results.iter().map(|g| g.spots.len()).sum();
     tracing::info!(
         n_groups = group_results.len(),

@@ -192,8 +192,9 @@ pub struct PamsoftProps {
     /// large rotations in MATLAB anyway — see GRID_PERFORMANCE.md).
     pub rotation: Vec<f64>,
     pub saturation_limit: f64,
-    /// `[low, high]` Canny thresholds (fractional). Low is fixed at 0 to
-    /// match the R operator.
+    /// `[low, high]` Canny thresholds (fractional). The R operator
+    /// declares `EdgeSensitivityLow` but never reads it (hardcodes 0);
+    /// we honour it so users can actually tune the lower bound.
     pub edge_sensitivity: [f64; 2],
     pub seg_method: String,
 }
@@ -203,6 +204,7 @@ pub struct PamsoftProps {
 /// invalid — the caller should surface those as Tercen task failures.
 pub fn read_pamsoft_props(settings: Option<&OperatorSettings>) -> Result<PamsoftProps, String> {
     let r = OperatorPropertyReader::new(settings);
+    let edge_low = r.get_f64("EdgeSensitivityLow")?;
     let edge_high = r.get_f64("Edge Sensitivity")?;
     Ok(PamsoftProps {
         min_diameter: r.get_f64("Min Diameter")?,
@@ -211,7 +213,7 @@ pub fn read_pamsoft_props(settings: Option<&OperatorSettings>) -> Result<Pamsoft
         spot_size: r.get_f64("Spot Size")?,
         rotation: parse_rotation(&r.get_string("Rotation"))?,
         saturation_limit: r.get_f64("Saturation Limit")?,
-        edge_sensitivity: [0.0, edge_high],
+        edge_sensitivity: [edge_low, edge_high],
         seg_method: r.get_enum("Segmentation Method")?,
     })
 }

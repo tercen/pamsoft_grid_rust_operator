@@ -37,9 +37,16 @@
     },
     {
       "kind": "DoubleProperty",
+      "name": "EdgeSensitivityLow",
+      "defaultValue": 0,
+      "description": "Canny edge low threshold (fractional). The R operator declares this property but never reads it — the Rust port honours it.",
+      "values": {}
+    },
+    {
+      "kind": "DoubleProperty",
       "name": "Edge Sensitivity",
       "defaultValue": 0.01,
-      "description": "Canny edge high threshold (fractional). Low threshold is fixed at 0.",
+      "description": "Canny edge high threshold (fractional).",
       "values": {}
     },
     {

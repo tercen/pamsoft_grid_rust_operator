@@ -1,22 +1,15 @@
 //! Stage 4: file download + ZIP extraction.
 //!
-//! For each chip group (keyed by primary documentId) in
-//! [`crate::input::InputData`], we fetch every unique `documentId` it
-//! references via tercen-rs' `FileService.download` streaming RPC,
-//! unzip into a per-group dir under the temp root, and locate the
-//! TIFFs + array-layout file. The output is a
-//! `BTreeMap<String, GroupFiles>` keyed by primary documentId — exactly
-//! the shape stage 5 (algorithm invocation) wants.
+//! Each `.ci` is one chip (matching R), but multiple `.ci`s typically
+//! share the same image ZIP (one ZIP holds many TIFFs across cycles ×
+//! exposures). We download each unique documentId once and index its
+//! TIFFs by filename stem; stage 5 then resolves per-row paths from the
+//! cache.
 //!
 //! Mirrors `aux_functions.R::prep_image_folder`'s contract:
 //! - The first documentId is the **image ZIP**.
 //! - The second documentId, if present, is the **array-layout text file**.
 //!   (When absent, the layout file is expected to live *inside* the ZIP.)
-//!
-//! Downloads run sequentially per chip and are deduplicated within the
-//! whole input: if two groups share a documentId we only fetch the bytes
-//! once. The temp dir is the caller's responsibility — it should clean
-//! up after the algorithm finishes.
 //!
 //! No fallbacks: gRPC errors, malformed ZIPs, missing TIFFs all bubble
 //! up as `anyhow::Error` so the Tercen task surfaces a clear failure
@@ -32,166 +25,129 @@ use tonic::Request;
 
 use crate::input::InputData;
 
-/// Where each group's input data ended up on disk after download +
-/// extraction. Stage 5 builds one `pamsoft_grid::types::GroupConfig`
-/// per entry.
+/// Where each downloaded documentId ended up on disk after fetch +
+/// (optional) ZIP extraction.
 #[derive(Debug, Clone)]
-pub struct GroupFiles {
-    /// Primary documentId for this chip group — the image ZIP's id.
-    /// Identifies the group and matches the key in the `BTreeMap`
-    /// returned by [`download_all_groups`].
-    pub doc_id: String,
-    /// `.ci` values of the rows that make up this group (one per image).
-    /// Same order as `image_paths`; stage 6 uses these to tag output spots.
-    pub cis: Vec<i32>,
-    /// Per-image filename stems (matches `InputRow.image_label`), in the
-    /// same order as `cis` / `image_paths`. Stage 6 maps a `SpotResult`'s
-    /// `image_name` (also a filename stem) back to its `.ci` via this Vec.
-    pub image_labels: Vec<String>,
-    /// Absolute paths to the TIFFs for this group, in column-facet row
-    /// order (matches `cis` / `image_labels`).
-    pub image_paths: Vec<PathBuf>,
-    /// Absolute path to the `* Array Layout*.txt` file — either supplied
-    /// as a separate documentId or located inside the image ZIP.
-    pub layout_path: PathBuf,
+pub struct DownloadedDoc {
+    /// Set when the bytes were a ZIP archive — points at the extracted
+    /// root directory.
+    pub extracted_root: Option<PathBuf>,
+    /// Set when the bytes were *not* a ZIP — points at the raw file.
+    pub raw_file: Option<PathBuf>,
+    /// `{filename_stem → absolute path}` for every `*.tif` found
+    /// recursively inside `extracted_root`. Empty if `extracted_root`
+    /// is `None`. Stage 5 looks up each row's `image_label` here to get
+    /// the TIFF path.
+    pub tiff_index: HashMap<String, PathBuf>,
 }
 
-/// Download every documentId referenced by the input, extract each ZIP
-/// once, and resolve the per-group image + layout paths.
-///
-/// `work_root` is a caller-owned temp dir (e.g. via [`tempfile::tempdir`])
-/// that will hold a `doc/<documentId>/` subtree per downloaded document.
-pub async fn download_all_groups(
+/// Catalogue of every downloaded documentId. Keyed by documentId so the
+/// algorithm stage can look up the image ZIP (for TIFFs) and the
+/// optional layout-file doc (for the array-layout text) by id.
+pub type DocumentCatalogue = BTreeMap<String, DownloadedDoc>;
+
+/// Download every unique documentId in `input`, extract the ZIPs, and
+/// index their TIFFs. Output is the per-doc catalogue plus the resolved
+/// path of the **layout file** — either a separate documentId or the
+/// `*Array Layout*.txt` discovered inside the first image-ZIP we see.
+pub async fn download_all(
     ctx: &ContextBase,
     input: &InputData,
     work_root: &Path,
-) -> Result<BTreeMap<String, GroupFiles>> {
+) -> Result<(DocumentCatalogue, PathBuf)> {
     std::fs::create_dir_all(work_root)
         .with_context(|| format!("create work root {}", work_root.display()))?;
 
-    // Deduplicate: each documentId is downloaded at most once across all
-    // groups. doc_extract_dirs[id] → path of the extracted-or-raw doc.
-    let mut doc_paths: HashMap<String, DownloadedDoc> = HashMap::new();
-    for row in input.groups.values().flatten() {
-        for doc_id in &row.document_ids {
-            if doc_paths.contains_key(doc_id) {
-                continue;
-            }
-            let dir = work_root.join("doc").join(doc_id);
-            std::fs::create_dir_all(&dir).with_context(|| {
-                format!("create doc dir {}", dir.display())
-            })?;
-            let doc = fetch_and_unpack(ctx, doc_id, &dir).await?;
-            doc_paths.insert(doc_id.clone(), doc);
-        }
+    // 1) Fetch + unpack every unique documentId in the input. Within one
+    // input the same ZIP doc-id is referenced by many .ci rows; download
+    // it once.
+    let mut catalogue: DocumentCatalogue = BTreeMap::new();
+    for doc_id in input.unique_document_ids() {
+        let dir = work_root.join("doc").join(&doc_id);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create doc dir {}", dir.display()))?;
+        let doc = fetch_and_unpack(ctx, &doc_id, &dir).await?;
+        catalogue.insert(doc_id, doc);
     }
 
-    // Per-group resolution: pick the image files and the layout out of
-    // the downloaded docs.
-    let mut groups = BTreeMap::new();
-    for (doc_id, rows) in &input.groups {
-        // Sanity: every row in a group should reference the same set of
-        // documentIds (they all share the primary doc_id, but verify
-        // the secondary layout-doc-id agrees too).
-        let first_docs = &rows[0].document_ids;
-        for r in rows.iter().skip(1) {
-            if r.document_ids != *first_docs {
+    // 2) Resolve the layout file. All rows in the input should agree on
+    // which doc-id supplies the layout (it's the second documentId if
+    // present, else it lives inside the image ZIP).
+    let layout_path = resolve_layout(input, &catalogue)?;
+
+    Ok((catalogue, layout_path))
+}
+
+/// Resolve the array-layout `.txt` path. Two strategies, matching the R
+/// operator (`aux_functions.R::prep_image_folder`):
+///
+/// 1. **Two documentId columns** → the second documentId is the layout
+///    file. Its `DownloadedDoc.raw_file` is the layout, or if the bytes
+///    happened to be a ZIP, we look for `*Array Layout*.txt` inside.
+/// 2. **One documentId column** → the layout lives inside the image
+///    ZIP. We probe the first row's image-ZIP doc and walk its
+///    extracted tree for the first match.
+fn resolve_layout(input: &InputData, catalogue: &DocumentCatalogue) -> Result<PathBuf> {
+    let first = input
+        .rows
+        .first()
+        .ok_or_else(|| anyhow!("no input rows — cannot resolve layout"))?;
+
+    if first.document_ids.len() == 2 {
+        let layout_doc_id = &first.document_ids[1];
+        // Sanity: every row must agree on the secondary doc-id (the
+        // primary can vary — that's just the image ZIP — but the layout
+        // doc-id is per-input).
+        for r in &input.rows {
+            if r.document_ids.get(1) != Some(layout_doc_id) {
                 bail!(
-                    "rows within chip group doc_id={} disagree on full \
-                     documentId tuple: {:?} vs {:?}. The primary doc_id matches \
-                     by construction; the secondary (layout) doc_id must too.",
-                    doc_id, first_docs, r.document_ids
+                    "row .ci={} disagrees on layout documentId ({:?} vs {:?}). \
+                     All rows must share the same secondary documentId.",
+                    r.ci,
+                    r.document_ids.get(1),
+                    Some(layout_doc_id),
                 );
             }
         }
-
-        let image_doc = doc_paths
-            .get(&first_docs[0])
-            .ok_or_else(|| anyhow!("missing download for doc {}", first_docs[0]))?;
-        let image_root = image_doc.extracted_root.as_deref().ok_or_else(|| {
+        let layout_doc = catalogue.get(layout_doc_id).ok_or_else(|| {
+            anyhow!("layout documentId {} was not downloaded", layout_doc_id)
+        })?;
+        layout_doc
+            .raw_file
+            .clone()
+            .or_else(|| {
+                layout_doc
+                    .extracted_root
+                    .as_deref()
+                    .and_then(locate_layout_file)
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "secondary documentId {} present but neither a raw layout file \
+                     nor a *Array Layout*.txt was found inside",
+                    layout_doc_id,
+                )
+            })
+    } else {
+        let image_doc_id = &first.document_ids[0];
+        let image_doc = catalogue
+            .get(image_doc_id)
+            .ok_or_else(|| anyhow!("image documentId {} was not downloaded", image_doc_id))?;
+        let root = image_doc.extracted_root.as_deref().ok_or_else(|| {
             anyhow!(
                 "documentId {} did not unzip — pamsoft expects an image ZIP \
-                 as the first documentId column",
-                first_docs[0]
+                 as the (sole) documentId column when no separate layout is provided",
+                image_doc_id,
             )
         })?;
-
-        // Pull TIFFs out of the extracted image-ZIP tree by matching each
-        // row's label_factor (filename stem) against `image_root/**/*.tif`.
-        let tiff_index = index_tiffs(image_root)?;
-        let mut image_paths = Vec::with_capacity(rows.len());
-        let mut cis = Vec::with_capacity(rows.len());
-        let mut image_labels = Vec::with_capacity(rows.len());
-        for row in rows {
-            let path = tiff_index.get(&row.image_label).ok_or_else(|| {
-                anyhow!(
-                    "chip doc_id={}, row .ci={}, label '{}': no TIFF matching that filename stem under {}. \
-                     Available stems: {}",
-                    doc_id,
-                    row.ci,
-                    row.image_label,
-                    image_root.display(),
-                    tiff_index.keys().take(5).cloned().collect::<Vec<_>>().join(", "),
-                )
-            })?;
-            image_paths.push(path.clone());
-            cis.push(row.ci);
-            image_labels.push(row.image_label.clone());
-        }
-
-        // Layout: second documentId if present (separate text file),
-        // otherwise look inside the image ZIP.
-        let layout_path = if first_docs.len() == 2 {
-            let layout_doc = doc_paths
-                .get(&first_docs[1])
-                .ok_or_else(|| anyhow!("missing download for layout doc {}", first_docs[1]))?;
-            layout_doc
-                .raw_file
-                .clone()
-                .or_else(|| {
-                    layout_doc
-                        .extracted_root
-                        .as_deref()
-                        .and_then(locate_layout_file)
-                })
-                .ok_or_else(|| {
-                    anyhow!(
-                        "second documentId {} present but neither raw file nor \
-                         a *Array Layout*.txt found inside",
-                        first_docs[1]
-                    )
-                })?
-        } else {
-            locate_layout_file(image_root).ok_or_else(|| {
-                anyhow!(
-                    "no separate layout documentId and no *Array Layout*.txt \
-                     found inside the image ZIP at {}",
-                    image_root.display()
-                )
-            })?
-        };
-
-        groups.insert(
-            doc_id.clone(),
-            GroupFiles {
-                doc_id: doc_id.clone(),
-                cis,
-                image_labels,
-                image_paths,
-                layout_path,
-            },
-        );
+        locate_layout_file(root).ok_or_else(|| {
+            anyhow!(
+                "no separate layout documentId and no *Array Layout*.txt \
+                 found inside the image ZIP at {}",
+                root.display(),
+            )
+        })
     }
-
-    Ok(groups)
-}
-
-/// A single downloaded documentId — either an extracted ZIP (then
-/// `extracted_root` is set) or a non-archive file (then `raw_file` is set).
-#[derive(Debug, Clone)]
-struct DownloadedDoc {
-    extracted_root: Option<PathBuf>,
-    raw_file: Option<PathBuf>,
 }
 
 /// Pull `doc_id` over gRPC, write it to `dir`, and either unzip it if it
@@ -215,9 +171,11 @@ async fn fetch_and_unpack(
         extract_zip(&bytes, &extracted).with_context(|| {
             format!("extract zip for doc {} into {}", doc_id, extracted.display())
         })?;
+        let tiff_index = index_tiffs(&extracted)?;
         Ok(DownloadedDoc {
             extracted_root: Some(extracted),
             raw_file: None,
+            tiff_index,
         })
     } else {
         // Non-archive — write the raw bytes to disk so the algorithm can
@@ -229,6 +187,7 @@ async fn fetch_and_unpack(
         Ok(DownloadedDoc {
             extracted_root: None,
             raw_file: Some(path),
+            tiff_index: HashMap::new(),
         })
     }
 }
@@ -319,8 +278,7 @@ fn index_tiffs(root: &Path) -> Result<HashMap<String, PathBuf>> {
 }
 
 /// First file under `root` whose name contains "Array Layout" (case-
-/// insensitive) and ends in `.txt`. Mirrors `bulk_regression`'s
-/// `locate_images_and_layout` heuristic at `src/bin/bulk_regression.rs:386-398`.
+/// insensitive) and ends in `.txt`.
 fn locate_layout_file(root: &Path) -> Option<PathBuf> {
     let mut found = None;
     let _ = walk(root, &mut |path| {

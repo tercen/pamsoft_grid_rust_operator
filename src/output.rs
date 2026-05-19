@@ -2,10 +2,8 @@
 //!
 //! Schema mirrors the R operator's `outFrame` in `main.R::do.grid`:
 //!
-//!   * `.ci`  (int32) — the **reference image's** `.ci` for the chip,
-//!     looked up by matching `SpotResult.image_name` to the chip's
-//!     `image_labels` Vec. R does `filter(get(imageCol) == griddingOutput$
-//!     grdImageNameUsed[1]) %>% pull(.ci)`.
+//!   * `.ci`  (int32) — the chip's `.ci`. One chip = one `.ci` = one
+//!     image, so every spot row for this chip carries the same `.ci`.
 //!   * `.ri`  (int32) — spot index 0..nGrid-1 within the chip. R relies
 //!     on `ctx$save()` to assign `.ri`, but tercen-rs' `save_table` is
 //!     literal — emit it explicitly so the relation aligns with the
@@ -19,8 +17,7 @@
 //!     (matches R's `as.double(as.logical(...))`)
 //!   * `{ns}.grdImageNameUsed` (string)
 //!
-//! The DataFrame concatenates all chips, ordered by `.ci`. Within each
-//! chip block, `.ri` ascends 0..nGrid-1.
+//! Sorted by `(.ci, .ri)` to match R's `arrange(.ci)`.
 
 use anyhow::{anyhow, Result};
 use polars::prelude::*;
@@ -51,34 +48,8 @@ pub fn build_result_df(groups: &[GroupResult], namespace: &str) -> Result<DataFr
     let mut image_name_vec: Vec<String> = Vec::with_capacity(total);
 
     for g in groups {
-        if g.spots.is_empty() {
-            continue;
-        }
-        // All spots in a chip share the same reference image (set by
-        // `use_image="Last"` in stage 5). Resolve the reference `.ci`
-        // once via the first spot's image_name; verify the rest agree
-        // so we catch upstream bugs loudly.
-        let ref_name = &g.spots[0].image_name;
-        let ref_ci = g
-            .image_labels
-            .iter()
-            .position(|lbl| lbl == ref_name)
-            .map(|idx| g.cis[idx])
-            .ok_or_else(|| {
-                anyhow!(
-                    "chip doc_id={}: spot reports grdImageNameUsed='{}' which is \
-                     not in the chip's image_labels {:?}. The algorithm picked a \
-                     reference image that wasn't in the input — likely a bug in \
-                     stage 5 or a mismatch between the layout file and the chip's \
-                     image set.",
-                    g.doc_id,
-                    ref_name,
-                    g.image_labels,
-                )
-            })?;
-
         for (ri, s) in g.spots.iter().enumerate() {
-            ci_vec.push(ref_ci);
+            ci_vec.push(g.ci);
             ri_vec.push(ri as i32);
             is_ref.push(if s.is_reference { "TRUE" } else { "FALSE" }.to_string());
             id_vec.push(s.spot_id.clone());

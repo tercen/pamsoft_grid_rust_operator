@@ -16,15 +16,17 @@
 //! per `.ci`. We separately stream the column-facet (positional `.ci`,
 //! row 0 → 0, row 1 → 1, …) for documentIds and join the two by `.ci`.
 //!
-//! Rows sharing a primary documentId belong to the same chip (same
-//! ZIP), so we **group rows by their primary documentId** to form chip
-//! groups for the algorithm. The original R operator groups by `.ci`;
-//! grouping by documentId is the semantically equivalent reconstruction
-//! given that we have to join across two tables anyway.
+//! Output shape mirrors the R operator's iteration model: **one chip
+//! per `.ci`** — even if multiple `.ci`s share an image-ZIP documentId.
+//! R does `group_by(.ci) %>% group_walk(prep_grid_files)` then one
+//! MATLAB invocation per `.ci` with that single image, so the result
+//! table has one distinct `grdImageNameUsed` per input image. We mirror
+//! that here, while still deduplicating ZIP downloads at stage 4 so
+//! multiple images from one ZIP only fetch the file once.
 
 use anyhow::{anyhow, bail, Context, Result};
 use polars::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tercen_rs::context::ContextBase;
 use tercen_rs::tson_to_dataframe;
 
@@ -32,9 +34,8 @@ use tercen_rs::tson_to_dataframe;
 #[derive(Debug, Clone)]
 pub struct InputRow {
     /// Implicit `.ci` for this row — the row index in the column-facet
-    /// table (which equals the crosstab column index). Carried through
-    /// so stage 6 (result table construction) can tag each output spot
-    /// back to its source column.
+    /// table (which equals the crosstab column index). The unit of work:
+    /// one chip = one `.ci` = one image (matches R `group_by(.ci)`).
     pub ci: i32,
     /// Filename stem of this image, taken from the first label factor.
     pub image_label: String,
@@ -48,14 +49,12 @@ pub struct InputRow {
 
 /// All rows from the input table, plus the schema introspection we
 /// did along the way (doc-ID column names + label factor name). Rows
-/// are grouped by their primary documentId — one chip = one image ZIP
-/// doc-id — so iteration over `groups` walks chip-by-chip.
+/// are ordered by `.ci` ascending — one row per crosstab column = one
+/// chip group of one image.
 #[derive(Debug, Clone)]
 pub struct InputData {
-    /// primary documentId (the image ZIP) → ordered list of rows
-    /// referencing that ZIP. Order within a group preserves the
-    /// column-facet row order (so `.ci`s within a group are ascending).
-    pub groups: BTreeMap<String, Vec<InputRow>>,
+    /// One row per crosstab column, ordered by `.ci`.
+    pub rows: Vec<InputRow>,
     /// Names of the documentId columns we found in the schema, in
     /// schema order. `len()` is always 1 or 2.
     pub document_id_columns: Vec<String>,
@@ -64,14 +63,26 @@ pub struct InputData {
 }
 
 impl InputData {
-    /// Number of distinct chip groups (one Rust grid-pipeline invocation per).
+    /// One chip-group per `.ci` (one chip = one image, matching R).
     pub fn n_groups(&self) -> usize {
-        self.groups.len()
+        self.rows.len()
     }
 
-    /// Total number of image rows across all groups.
+    /// Total number of image rows. Equal to `n_groups()` in this shape;
+    /// kept as a separate accessor so callers stay decoupled from the
+    /// invariant in case future versions allow multi-image chips.
     pub fn n_rows(&self) -> usize {
-        self.groups.values().map(|v| v.len()).sum()
+        self.rows.len()
+    }
+
+    /// Set of unique documentIds across all rows — every entry needs to
+    /// be downloaded once at stage 4. Includes both primary (image ZIP)
+    /// and secondary (optional layout file) doc-ids.
+    pub fn unique_document_ids(&self) -> BTreeSet<String> {
+        self.rows
+            .iter()
+            .flat_map(|r| r.document_ids.iter().cloned())
+            .collect()
     }
 }
 
@@ -236,7 +247,7 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     }
 
     // --- Join: for each column-facet row (positional .ci), pull its label ---
-    let mut groups: BTreeMap<String, Vec<InputRow>> = BTreeMap::new();
+    let mut rows = Vec::with_capacity(n_cols);
     for row_idx in 0..n_cols {
         let ci = row_idx as i32;
         let image_label = ci_to_label
@@ -257,8 +268,7 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
                     .map(String::from)
             })
             .collect::<Result<Vec<_>>>()?;
-        let group_key = document_ids[0].clone();
-        groups.entry(group_key).or_default().push(InputRow {
+        rows.push(InputRow {
             ci,
             image_label,
             document_ids,
@@ -266,7 +276,7 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     }
 
     Ok(InputData {
-        groups,
+        rows,
         document_id_columns,
         label_column,
     })
