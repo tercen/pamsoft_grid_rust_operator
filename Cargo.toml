@@ -40,7 +40,7 @@ serde_json = "1.0"
 
 # Columnar input/output. tercen-rs ships polars transitively but we use
 # it directly for input-table parsing and result DataFrame construction.
-polars = { version = "0.51", features = ["lazy", "dtype-full"] }
+polars = { version = "0.51", features = ["lazy", "dtype-full", "csv"] }
 
 # Image ZIPs (Tercen documentId column) are .zip archives — we
 # stream-download then extract via the same approach bulk_regression

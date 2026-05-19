@@ -151,13 +151,44 @@ async fn execute(ctx: &ContextBase, task_id: Option<&str>) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("upload result table: {e:#}"))?;
         }
         None => {
-            tracing::info!(
-                n_rows = df.height(),
-                "dev mode: skipping save_table (no task — DevContext has no ETask to mutate)"
-            );
+            // In dev mode, dump the result DataFrame to a local CSV when
+            // OUTPUT_CSV is set. Used by the e2e test driver to diff
+            // against the R operator's Tercen-side output without going
+            // through the Docker-build / save_table round-trip.
+            if let Ok(path) = std::env::var("OUTPUT_CSV") {
+                write_csv(&df, &path)
+                    .map_err(|e| anyhow::anyhow!("dump result CSV to {path}: {e:#}"))?;
+                tracing::info!(
+                    n_rows = df.height(),
+                    path,
+                    "dev mode: result DataFrame written to CSV"
+                );
+            } else {
+                tracing::info!(
+                    n_rows = df.height(),
+                    "dev mode: skipping save_table (no task — DevContext has no ETask to \
+                     mutate). Set OUTPUT_CSV=<path> to dump the result DataFrame locally."
+                );
+            }
         }
     }
 
+    Ok(())
+}
+
+/// Dump a DataFrame to a CSV. Used only in dev mode + only when
+/// `OUTPUT_CSV` is set, so the I/O dep stays out of the production hot
+/// path. Format matches Polars' default `CsvWriter` (RFC 4180-ish, with
+/// the header row).
+fn write_csv(df: &polars::frame::DataFrame, path: &str) -> Result<()> {
+    use polars::prelude::*;
+    let mut df = df.clone();
+    let mut f = std::fs::File::create(path)
+        .with_context(|| format!("create CSV at {path}"))?;
+    CsvWriter::new(&mut f)
+        .include_header(true)
+        .finish(&mut df)
+        .map_err(|e| anyhow::anyhow!("CsvWriter: {e}"))?;
     Ok(())
 }
 
