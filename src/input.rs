@@ -1,23 +1,26 @@
 //! Input table reading for the pamsoft_grid operator.
 //!
-//! The operator's input is a Tercen crosstab whose **column factor**
-//! carries:
+//! The operator's input is a Tercen crosstab where:
 //!
-//!   * One or more `documentId`-typed factors — Tercen document IDs of
-//!     the image ZIP (and optionally the layout file). 1 or 2, matching
-//!     the R operator's contract.
-//!   * One label factor — the per-image **filename stem** (the
-//!     `ctx$labels[[1]]` the R operator uses).
+//!   * The **column factor** carries one or two `documentId`-typed
+//!     factors — Tercen document IDs of the image ZIP (and optionally
+//!     the layout file). Matches the R operator's contract.
+//!   * The **y-axis projection** carries at least one label factor —
+//!     the per-image **filename stem** (the `ctx$labels[[1]]` the R
+//!     operator uses).
 //!
-//! Each row of the column-facet table is one column in the crosstab —
-//! one image. Rows sharing a `documentId` belong to the same chip
-//! (same ZIP), so we **group rows by their primary documentId** to
-//! form chip groups for the algorithm. The original R operator groups
-//! by `.ci`; that only works on the main data table, where `.ci`
-//! is the column index. The column-facet table itself has no `.ci`
-//! column — it's positional (row 0 → .ci=0, row 1 → .ci=1, …) — and
-//! grouping by documentId is the semantically equivalent way to
-//! reconstruct chips from this side of the join.
+//! Labels do NOT live on the column-facet table — `ctx$labels[[1]]` in
+//! R is broadcast into the main data table (`qt_hash`), one value per
+//! `(.ri, .ci)` cell. To get one label per crosstab column we stream
+//! `.ci` + label from `qt_hash` and take the first non-null value seen
+//! per `.ci`. We separately stream the column-facet (positional `.ci`,
+//! row 0 → 0, row 1 → 1, …) for documentIds and join the two by `.ci`.
+//!
+//! Rows sharing a primary documentId belong to the same chip (same
+//! ZIP), so we **group rows by their primary documentId** to form chip
+//! groups for the algorithm. The original R operator groups by `.ci`;
+//! grouping by documentId is the semantically equivalent reconstruction
+//! given that we have to join across two tables anyway.
 
 use anyhow::{anyhow, bail, Context, Result};
 use polars::prelude::*;
@@ -72,11 +75,13 @@ impl InputData {
     }
 }
 
-/// Stream the column-facet table and decode it into [`InputData`].
+/// Load the operator's input by joining the column-facet table (for
+/// documentIds, indexed positionally by `.ci`) with the main data table
+/// (for labels, keyed explicitly by `.ci`).
 ///
 /// Errors loudly (no fallbacks) when the input shape doesn't match the
 /// R operator's contract — wrong number of doc-ID columns, missing
-/// label factor, empty column-facet table, etc.
+/// label factor, empty tables, etc.
 ///
 /// Takes `&ContextBase` rather than the `TercenContext` trait so we can
 /// call `ctx.streamer()` and `ctx.cnames()` (which live on the concrete
@@ -86,9 +91,9 @@ impl InputData {
 /// of the conversion.
 pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     // Identify the column-facet table — that's where the documentId
-    // columns and the label factor live.
-    let table_id = ctx.cube_query().column_hash.clone();
-    if table_id.is_empty() {
+    // columns live.
+    let col_table_id = ctx.cube_query().column_hash.clone();
+    if col_table_id.is_empty() {
         bail!(
             "operator has no column-facet table (cube_query.column_hash is empty). \
              The pamsoft_grid_operator expects at least one column factor — the \
@@ -96,9 +101,9 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         );
     }
 
-    // Schema introspection: enumerate column names and find the documentId
-    // column(s) by name substring (matches the R operator's `grepl("documentId", x)`
-    // heuristic at `main.R:190-192`).
+    // Schema introspection: enumerate column-facet column names and find
+    // the documentId column(s) by name substring (matches the R operator's
+    // `grepl("documentId", x)` heuristic at `main.R:190-192`).
     let all_cnames = ctx
         .cnames()
         .await
@@ -118,12 +123,9 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         );
     }
 
-    // The label factor names come from the first axis query's `labels`.
+    // The label factor name comes from the first axis query's `labels`.
     // The R operator uses `ctx$labels[[1]]` (the first one) as the image
-    // filename per row. Re-implementing the trait's default `labels()`
-    // inline because `ContextBase` itself doesn't impl `TercenContext` —
-    // only its wrappers do, and we'd rather take the concrete base type
-    // to keep `cnames()` / `streamer()` reachable.
+    // filename per row.
     let label_column = ctx
         .cube_query()
         .axis_queries
@@ -132,71 +134,126 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         .ok_or_else(|| {
             anyhow!(
                 "no label factor on the input — the operator needs a label \
-                 factor carrying each image's filename stem (matches the R \
-                 operator's `ctx$labels[[1]]`)."
+                 factor on the y-axis projection carrying each image's \
+                 filename stem (matches the R operator's `ctx$labels[[1]]`)."
             )
         })?
         .name
         .clone();
 
-    // Stream the whole column-facet table, restricted to the columns
-    // we actually need. We do NOT request `.ci` — that column lives on
-    // the main data table (qt_hash), not on the column-facet table.
-    // The crosstab column index for row N of the column-facet table is
-    // simply N (positional convention).
-    let mut cols = vec![label_column.clone()];
-    cols.extend(document_id_columns.iter().cloned());
-
+    // --- Stream column-facet for documentIds (one row per .ci) ---
     let streamer = ctx.streamer();
-    let tson = streamer
-        .stream_tson(&table_id, Some(cols.clone()), 0, -1)
+    let col_tson = streamer
+        .stream_tson(
+            &col_table_id,
+            Some(document_id_columns.clone()),
+            0,
+            -1,
+        )
         .await
-        .map_err(|e| anyhow!("stream column-facet table {table_id}: {e}"))?;
-    let df = tson_to_dataframe(&tson).context("parse TSON column-facet payload")?;
+        .map_err(|e| anyhow!("stream column-facet table {col_table_id}: {e}"))?;
+    let col_df = tson_to_dataframe(&col_tson).context("parse TSON column-facet payload")?;
 
-    // Pull the columns we need out of the DataFrame.
-    let label_col = df
-        .column(&label_column)
-        .map_err(|e| anyhow!("missing label column '{}': {}", label_column, e))?
-        .cast(&DataType::String)
-        .context("cast label column to string")?;
     let doc_cols: Vec<Series> = document_id_columns
         .iter()
         .map(|name| {
-            df.column(name)
+            col_df
+                .column(name)
                 .map_err(|e| anyhow!("missing documentId column '{}': {}", name, e))
                 .and_then(|s| s.cast(&DataType::String).context("cast doc id to string"))
                 .map(|c| c.take_materialized_series())
         })
         .collect::<Result<Vec<_>>>()?;
-
-    let label_series = label_col.str().context("label is not string")?;
     let doc_series: Vec<&StringChunked> = doc_cols
         .iter()
         .map(|s| s.str().context("documentId is not string"))
         .collect::<Result<Vec<_>>>()?;
-
-    let n = label_series.len();
-    if n == 0 {
+    let n_cols = doc_series
+        .first()
+        .map(|s| s.len())
+        .unwrap_or(0);
+    if n_cols == 0 {
         bail!(
             "column-facet table is empty — no images to process. Check the \
              workflow's input step produces at least one row."
         );
     }
-    // Group by the primary documentId (the image ZIP). Rows referring
-    // to the same ZIP are by definition images from the same chip.
+
+    // --- Stream main data table for `.ci` + label (broadcast per cell) ---
+    // Pick the first non-null label per `.ci`. The label is constant
+    // across `.ri` for a given `.ci` by construction (it's a column-level
+    // attribute), so the first non-null seen is the answer.
+    let qt_table_id = ctx.cube_query().qt_hash.clone();
+    if qt_table_id.is_empty() {
+        bail!(
+            "operator has no main data table (cube_query.qt_hash is empty). \
+             This shouldn't happen for a normal crosstab — re-check the workflow."
+        );
+    }
+    let qt_tson = streamer
+        .stream_tson(
+            &qt_table_id,
+            Some(vec![".ci".to_string(), label_column.clone()]),
+            0,
+            -1,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "stream main data table {qt_table_id} for .ci + label '{label_column}': {e}. \
+                 Available main-table columns may be different; the label factor must be \
+                 a label on axis_queries[0] and present on the main data."
+            )
+        })?;
+    let qt_df = tson_to_dataframe(&qt_tson).context("parse TSON main-table payload")?;
+
+    let ci_col = qt_df
+        .column(".ci")
+        .map_err(|e| anyhow!("missing .ci column on main table: {e}"))?
+        .cast(&DataType::Int32)
+        .context("cast .ci to int32")?;
+    let label_col = qt_df
+        .column(&label_column)
+        .map_err(|e| anyhow!("missing label column '{}' on main table: {}", label_column, e))?
+        .cast(&DataType::String)
+        .context("cast label column to string")?;
+    let ci_chunked = ci_col.i32().context(".ci is not int32")?;
+    let label_chunked = label_col.str().context("label is not string")?;
+
+    let mut ci_to_label: BTreeMap<i32, String> = BTreeMap::new();
+    for (ci_opt, lbl_opt) in ci_chunked.into_iter().zip(label_chunked.into_iter()) {
+        let (Some(ci), Some(lbl)) = (ci_opt, lbl_opt) else {
+            continue;
+        };
+        ci_to_label.entry(ci).or_insert_with(|| lbl.to_string());
+    }
+    if ci_to_label.is_empty() {
+        bail!(
+            "main data table yielded zero (.ci, label) pairs — label column \
+             '{label_column}' appears to be all-null on qt_hash. Check that the \
+             label factor is wired into the workflow."
+        );
+    }
+
+    // --- Join: for each column-facet row (positional .ci), pull its label ---
     let mut groups: BTreeMap<String, Vec<InputRow>> = BTreeMap::new();
-    for row_idx in 0..n {
+    for row_idx in 0..n_cols {
         let ci = row_idx as i32;
-        let image_label = label_series
-            .get(row_idx)
-            .ok_or_else(|| anyhow!("null label at row {row_idx}"))?
-            .to_string();
+        let image_label = ci_to_label
+            .get(&ci)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no label found in main table for .ci={ci} (column-facet has \
+                     {n_cols} rows but main table is missing this column). The \
+                     workflow may have an empty column."
+                )
+            })?
+            .clone();
         let document_ids: Vec<String> = doc_series
             .iter()
             .map(|s| {
                 s.get(row_idx)
-                    .ok_or_else(|| anyhow!("null documentId at row {row_idx}"))
+                    .ok_or_else(|| anyhow!("null documentId at .ci={ci}"))
                     .map(String::from)
             })
             .collect::<Result<Vec<_>>>()?;
