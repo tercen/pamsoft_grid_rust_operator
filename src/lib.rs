@@ -12,7 +12,9 @@
 pub mod algorithm;
 pub mod download;
 pub mod input;
+pub mod output;
 pub mod props;
+pub mod upload;
 
 use std::sync::Arc;
 
@@ -33,7 +35,7 @@ pub async fn run(task_id: &str) -> Result<()> {
     let ctx = ProductionContext::from_task_id(client, task_id)
         .await
         .map_err(|e| anyhow::anyhow!("load task {task_id}: {e}"))?;
-    execute(&ctx).await
+    execute(&ctx, Some(task_id)).await
 }
 
 /// Dev entry point. Bootstraps a `DevContext` from a workflow/step
@@ -51,7 +53,7 @@ pub async fn run_dev(workflow_id: &str, step_id: &str) -> Result<()> {
     let ctx = DevContext::from_workflow_step(client, workflow_id, step_id)
         .await
         .map_err(|e| anyhow::anyhow!("load workflow {workflow_id} / step {step_id}: {e}"))?;
-    execute(&ctx).await
+    execute(&ctx, None).await
 }
 
 async fn build_client() -> Result<Arc<TercenClient>> {
@@ -66,11 +68,10 @@ async fn build_client() -> Result<Arc<TercenClient>> {
 /// the concrete `&ContextBase` since `ProductionContext` and
 /// `DevContext` both `Deref<Target = ContextBase>`).
 ///
-/// Currently only handles stages 1-3 of the operator port: bootstrap,
-/// property parsing, input-table reading. Stages 4-7 (file download,
-/// algorithm invocation, result-table construction, upload) land in
-/// subsequent commits.
-async fn execute(ctx: &ContextBase) -> Result<()> {
+/// `task_id` is `Some(...)` in production mode (so we can fetch the
+/// `ETask` and upload results via `save_table`) and `None` in dev mode
+/// (no task — we just log the result row count and return).
+async fn execute(ctx: &ContextBase, task_id: Option<&str>) -> Result<()> {
     tracing::info!(
         workflow = ctx.workflow_id(),
         step = ctx.step_id(),
@@ -109,8 +110,8 @@ async fn execute(ctx: &ContextBase) -> Result<()> {
     // task-scoped — Tercen task containers are ephemeral so cleanup
     // happens on container exit; we still RemoveOnDrop it in case the
     // operator is rerun in the same container (dev mode).
-    let task_id = ctx.workflow_id().to_string() + "_" + ctx.step_id();
-    let work_root = std::env::temp_dir().join(format!("pamsoft_op_{}", task_id));
+    let work_dir_key = ctx.workflow_id().to_string() + "_" + ctx.step_id();
+    let work_root = std::env::temp_dir().join(format!("pamsoft_op_{}", work_dir_key));
     let _drop_guard = TempDirGuard(work_root.clone());
     let groups = download::download_all_groups(ctx, &input_data, &work_root)
         .await
@@ -128,8 +129,33 @@ async fn execute(ctx: &ContextBase) -> Result<()> {
     tracing::info!(
         n_groups = group_results.len(),
         total_spots,
-        "grid algorithm complete — stages 6-7 (result table + upload) not wired yet"
+        "grid algorithm complete"
     );
+
+    // Stage 6: build the Polars result DataFrame.
+    let df = output::build_result_df(&group_results, ctx.namespace())
+        .map_err(|e| anyhow::anyhow!("build result DataFrame: {e:#}"))?;
+    tracing::info!(
+        n_rows = df.height(),
+        n_cols = df.width(),
+        namespace = ctx.namespace(),
+        "result DataFrame built"
+    );
+
+    // Stage 7: upload (production) or log + skip (dev).
+    match task_id {
+        Some(tid) => {
+            upload::save_results(ctx, tid, &df)
+                .await
+                .map_err(|e| anyhow::anyhow!("upload result table: {e:#}"))?;
+        }
+        None => {
+            tracing::info!(
+                n_rows = df.height(),
+                "dev mode: skipping save_table (no task — DevContext has no ETask to mutate)"
+            );
+        }
+    }
 
     Ok(())
 }

@@ -27,6 +27,11 @@ pub struct GroupResult {
     /// Per-image `.ci` values, parallel to the images that produced
     /// the spots. One entry per image in this group.
     pub cis: Vec<i32>,
+    /// Per-image filename stems, parallel to `cis`. Stage 6 maps a
+    /// `SpotResult.image_name` (also a filename stem) back to its `.ci`
+    /// via this Vec — mirroring the R operator's `filter(get(imageCol)
+    /// == griddingOutput$grdImageNameUsed[1]) %>% pull(.ci)`.
+    pub image_labels: Vec<String>,
     pub spots: Vec<SpotResult>,
     /// Effective spot pitch used (after auto-detection if the user left
     /// `Spot Pitch = 0`). Surfaced for logging / debugging.
@@ -102,6 +107,7 @@ pub fn run_grid_per_group(
         out.push(GroupResult {
             doc_id: doc_id.clone(),
             cis: files.cis.clone(),
+            image_labels: files.image_labels.clone(),
             spots,
             spot_pitch,
         });

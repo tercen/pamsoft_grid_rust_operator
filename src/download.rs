@@ -44,8 +44,12 @@ pub struct GroupFiles {
     /// `.ci` values of the rows that make up this group (one per image).
     /// Same order as `image_paths`; stage 6 uses these to tag output spots.
     pub cis: Vec<i32>,
+    /// Per-image filename stems (matches `InputRow.image_label`), in the
+    /// same order as `cis` / `image_paths`. Stage 6 maps a `SpotResult`'s
+    /// `image_name` (also a filename stem) back to its `.ci` via this Vec.
+    pub image_labels: Vec<String>,
     /// Absolute paths to the TIFFs for this group, in column-facet row
-    /// order (matches `cis`).
+    /// order (matches `cis` / `image_labels`).
     pub image_paths: Vec<PathBuf>,
     /// Absolute path to the `* Array Layout*.txt` file — either supplied
     /// as a separate documentId or located inside the image ZIP.
@@ -117,6 +121,7 @@ pub async fn download_all_groups(
         let tiff_index = index_tiffs(image_root)?;
         let mut image_paths = Vec::with_capacity(rows.len());
         let mut cis = Vec::with_capacity(rows.len());
+        let mut image_labels = Vec::with_capacity(rows.len());
         for row in rows {
             let path = tiff_index.get(&row.image_label).ok_or_else(|| {
                 anyhow!(
@@ -131,6 +136,7 @@ pub async fn download_all_groups(
             })?;
             image_paths.push(path.clone());
             cis.push(row.ci);
+            image_labels.push(row.image_label.clone());
         }
 
         // Layout: second documentId if present (separate text file),
@@ -170,6 +176,7 @@ pub async fn download_all_groups(
             GroupFiles {
                 doc_id: doc_id.clone(),
                 cis,
+                image_labels,
                 image_paths,
                 layout_path,
             },
