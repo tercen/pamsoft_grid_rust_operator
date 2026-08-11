@@ -55,8 +55,14 @@ pub fn build_result_df(groups: &[GroupResult], namespace: &str) -> Result<DataFr
             id_vec.push(s.spot_id.clone());
             row_vec.push(s.row);
             col_vec.push(s.col);
-            x_fixed.push(s.x_fixed);
-            y_fixed.push(s.y_fixed);
+            // grdXFixedPosition/grdYFixedPosition: R emits the fitted position
+            // here (grdXFixedPosition == gridX for every spot). `x_fixed` is
+            // only non-zero for genuine anchor/fixed spots (bFixedSpot); for
+            // the ordinary spots it's 0, so fall back to the fitted grid_x/y to
+            // match R. Downstream (the Grid Checker) reads these and would
+            // otherwise propagate a spurious 0.
+            x_fixed.push(if s.x_fixed != 0.0 { s.x_fixed } else { s.grid_x });
+            y_fixed.push(if s.y_fixed != 0.0 { s.y_fixed } else { s.grid_y });
             grid_x.push(s.grid_x);
             grid_y.push(s.grid_y);
             diameter.push(s.diameter);
