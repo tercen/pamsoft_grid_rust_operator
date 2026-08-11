@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
     - uses: actions/checkout@v2
       with:
@@ -43,6 +45,26 @@ jobs:
         docker push $DOCKER_IMAGE:$TAG
         docker tag $DOCKER_IMAGE:$TAG $DOCKER_IMAGE:latest
         docker push $DOCKER_IMAGE:latest
+    - name: Pin operator.json to the tagged image and re-point the tag
+      # The 'Update container' step rewrites operator.json to the versioned
+      # image, but that change was never committed — so a Tercen git-install
+      # of the tag read :latest and the worker ran a stale cached image.
+      # Commit the pinned operator.json and force-move the tag onto it.
+      # Pushing with GITHUB_TOKEN does NOT re-trigger this workflow (Actions'
+      # recursion guard); '[skip ci]' is belt-and-braces.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        if git diff --quiet -- operator.json; then
+          echo "operator.json already pinned; nothing to do"
+          exit 0
+        fi
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add operator.json
+        git commit -m "release $TAG: pin operator.json to $DOCKER_IMAGE:$TAG [skip ci]"
+        git tag -f "$TAG"
+        git push -f origin "refs/tags/$TAG"
     # Integration test against a live Tercen instance. Disabled while the
     # operator is still stubs; re-enable once the repo is public or a PAT
     # with read access is wired as TERCEN_GITHUB_TOKEN.
