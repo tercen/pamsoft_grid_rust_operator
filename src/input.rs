@@ -11,13 +11,15 @@
 //!
 //! Labels do NOT live on the column-facet table — `ctx$labels[[1]]` in
 //! R is broadcast into the main data table (`qt_hash`), one value per
-//! `(.ri, .ci)` cell. A `.ci` (crosstab column) carries MULTIPLE images
-//! along `.ri` — the acquisition cycles (e.g. P32 … P92). R passes the
-//! whole per-`.ci` image list to the grid binary with `grdUseImage="Last"`,
-//! so it grids on the last one (highest `.ri`). We reproduce that by
-//! streaming `.ci` + `.ri` + label from `qt_hash` and picking the label at
-//! the maximum `.ri` per `.ci`. We separately stream the column-facet
-//! (positional `.ci`, row 0 → 0, …) for documentIds and join by `.ci`.
+//! `(.ri, .ci)` cell. A `.ci` (crosstab column) carries MULTIPLE images as
+//! successive rows — the acquisition cycles (e.g. P32 … P92) — ordered by
+//! the table's row/stream order (they are NOT distinguished by `.ri`, which
+//! is constant within a `.ci` here). R passes the whole per-`.ci` image list
+//! to the grid binary with `grdUseImage="Last"`, so it grids on the last one
+//! in that row order. We reproduce that by streaming `.ci` + label from
+//! `qt_hash` and keeping the LAST label seen per `.ci`. We separately stream
+//! the column-facet (positional `.ci`, row 0 → 0, …) for documentIds and
+//! join by `.ci`.
 //!
 //! Output shape mirrors the R operator: **one grid per `.ci`**, using that
 //! column's last-cycle image as the reference, so the result table has one
@@ -190,14 +192,16 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         );
     }
 
-    // --- Stream main data table for `.ci` + `.ri` + label ---
-    // A `.ci` (crosstab column) maps to MULTIPLE images along `.ri` — the
-    // acquisition cycles (e.g. P32 … P92). The R operator grids on the
-    // *last* image per column (`grdUseImage = "Last"`, main.R), which is the
-    // one at the highest `.ri`. So we pick the label at the maximum `.ri`
-    // per `.ci`, NOT the first seen. Picking the first silently gridded the
-    // earliest cycle (P32) instead of R's last cycle (P92) — a different
-    // reference image, so the fitted grid itself diverged.
+    // --- Stream main data table for `.ci` + label ---
+    // A `.ci` (crosstab column) carries MULTIPLE images as successive rows —
+    // the acquisition cycles (e.g. P32 … P92). They are NOT distinguished by
+    // `.ri` (which is constant within a `.ci` for this input); the ordering is
+    // the table's row/stream order. The R operator passes the whole per-`.ci`
+    // image list to the grid binary with `grdUseImage="Last"`, so it grids on
+    // the LAST image in that row order (P92). We reproduce that by keeping the
+    // LAST non-null label seen per `.ci`. Keeping the *first* (the previous
+    // behaviour) silently gridded the earliest cycle (P32) — a different
+    // reference image, so the fitted grid itself diverged from R.
     let qt_table_id = ctx.cube_query().qt_hash.clone();
     if qt_table_id.is_empty() {
         bail!(
@@ -208,18 +212,14 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
     let qt_tson = streamer
         .stream_tson(
             &qt_table_id,
-            Some(vec![
-                ".ci".to_string(),
-                ".ri".to_string(),
-                label_column.clone(),
-            ]),
+            Some(vec![".ci".to_string(), label_column.clone()]),
             0,
             -1,
         )
         .await
         .map_err(|e| {
             anyhow!(
-                "stream main data table {qt_table_id} for .ci + .ri + label '{label_column}': {e}. \
+                "stream main data table {qt_table_id} for .ci + label '{label_column}': {e}. \
                  Available main-table columns may be different; the label factor must be \
                  a label on axis_queries[0] and present on the main data."
             )
@@ -231,43 +231,24 @@ pub async fn load_input_data(ctx: &ContextBase) -> Result<InputData> {
         .map_err(|e| anyhow!("missing .ci column on main table: {e}"))?
         .cast(&DataType::Int32)
         .context("cast .ci to int32")?;
-    let ri_col = qt_df
-        .column(".ri")
-        .map_err(|e| anyhow!("missing .ri column on main table: {e}"))?
-        .cast(&DataType::Int32)
-        .context("cast .ri to int32")?;
     let label_col = qt_df
         .column(&label_column)
         .map_err(|e| anyhow!("missing label column '{}' on main table: {}", label_column, e))?
         .cast(&DataType::String)
         .context("cast label column to string")?;
     let ci_chunked = ci_col.i32().context(".ci is not int32")?;
-    let ri_chunked = ri_col.i32().context(".ri is not int32")?;
     let label_chunked = label_col.str().context("label is not string")?;
 
-    // Keep the label at the highest `.ri` per `.ci` (R's `grdUseImage="Last"`).
-    let mut ci_to_best: BTreeMap<i32, (i32, String)> = BTreeMap::new();
-    for ((ci_opt, ri_opt), lbl_opt) in ci_chunked
-        .into_iter()
-        .zip(ri_chunked.into_iter())
-        .zip(label_chunked.into_iter())
-    {
-        let (Some(ci), Some(ri), Some(lbl)) = (ci_opt, ri_opt, lbl_opt) else {
+    // Keep the LAST non-null label seen per `.ci` in row/stream order — the
+    // `insert` overwrites earlier rows, so the final value is the last image
+    // (R's `grdUseImage="Last"`).
+    let mut ci_to_label: BTreeMap<i32, String> = BTreeMap::new();
+    for (ci_opt, lbl_opt) in ci_chunked.into_iter().zip(label_chunked.into_iter()) {
+        let (Some(ci), Some(lbl)) = (ci_opt, lbl_opt) else {
             continue;
         };
-        ci_to_best
-            .entry(ci)
-            .and_modify(|best| {
-                if ri > best.0 {
-                    *best = (ri, lbl.to_string());
-                }
-            })
-            .or_insert_with(|| (ri, lbl.to_string()));
+        ci_to_label.insert(ci, lbl.to_string());
     }
-    let ci_to_label: BTreeMap<i32, String> = ci_to_best
-        .into_iter()
-        .map(|(ci, (_ri, lbl))| (ci, lbl))
-        .collect();
     if ci_to_label.is_empty() {
         bail!(
             "main data table yielded zero (.ci, label) pairs — label column \
