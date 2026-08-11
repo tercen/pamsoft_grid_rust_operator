@@ -5,7 +5,7 @@
   "communicationProtocol": "grpc",
   "authors": ["Tercen", "Thiago"],
   "urls": ["https://github.com/tercen/pamsoft_grid_rust_operator"],
-  "container": "pamgene/pamsoft_grid_rust_operator:latest",
+  "container": "pamgene/pamsoft_grid_rust_operator:0.4.3",
   "properties": [
     {
       "kind": "DoubleProperty",
