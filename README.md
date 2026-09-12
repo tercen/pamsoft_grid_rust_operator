@@ -106,3 +106,21 @@ src/lib.rs::execute
    └── src/algorithm.rs    — pamsoft_grid::batch::process_single_group
                              (currently no result upload; stages 6-7 pending)
 ```
+
+## Memory model
+
+`memory_model.json` tells Tercen how much memory to book for a run:
+
+```
+booking (MB) = 1.5 × 120 + 4.0e-6 × total input image bytes
+             = 180 MB + 4 × image size
+```
+
+It was fitted on the peaks Tercen records on every task
+(`stats_d_actual_ram_peak` / `stats_d_actual_ram_peak_anon`) over ~150
+bionavigator runs: this operator's anonymous memory is essentially the raw
+image bytes, and the total including page cache is about 2.8× that. The
+booking sits above the largest recorded total peak with a ≥10 % margin and
+above the anonymous peak by ≥2.5×, while staying 2–3× below what the platform
+default (500 MB + 5 × input bytes) booked. Re-fit the two numbers if the
+decoding path changes.
