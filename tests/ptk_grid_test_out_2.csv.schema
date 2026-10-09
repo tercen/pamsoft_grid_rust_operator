@@ -1,0 +1,157 @@
+{
+  "kind": "CubeQueryTableSchema",
+  "isDeleted": false,
+  "description": "",
+  "name": "column",
+  "acl": {
+    "kind": "Acl",
+    "owner": "admin",
+    "aces": []
+  },
+  "createdDate": {
+    "kind": "Date",
+    "value": "2026-10-09T23:20:50.812050Z"
+  },
+  "lastModifiedDate": {
+    "kind": "Date",
+    "value": "2026-10-09T23:20:50.812050Z"
+  },
+  "urls": [],
+  "tags": [],
+  "meta": [
+    {
+      "kind": "Pair",
+      "key": "documentId.max_cell_bytes",
+      "value": "36"
+    },
+    {
+      "kind": "Pair",
+      "key": "Array.size_in_bytes",
+      "value": "112"
+    },
+    {
+      "kind": "Pair",
+      "key": "Array.max_cell_bytes",
+      "value": "2"
+    },
+    {
+      "kind": "Pair",
+      "key": "documentId.size_in_bytes",
+      "value": "192"
+    }
+  ],
+  "url": {
+    "kind": "Url",
+    "uri": ""
+  },
+  "version": "",
+  "isPublic": false,
+  "projectId": "1db5524f-399e-40b9-b962-9ef9a481665d",
+  "folderId": "",
+  "nRows": 2,
+  "columns": [
+    {
+      "kind": "ColumnSchema",
+      "id": "3e91d2e0-8cfe-4878-98c0-0e1f99db2a05",
+      "name": "documentId",
+      "type": "string",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "3490b313-522f-41f8-b5f4-ae62d9cb00d8",
+      "name": "Barcode",
+      "type": "double",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    },
+    {
+      "kind": "ColumnSchema",
+      "id": "36560520-3be9-4b71-be76-7ea42e551ccd",
+      "name": "Array",
+      "type": "string",
+      "nRows": 0,
+      "size": -1,
+      "metaData": {
+        "kind": "ColumnSchemaMetaData",
+        "sort": [],
+        "ascending": true,
+        "quartiles": [],
+        "properties": []
+      },
+      "storageSize": -1.0
+    }
+  ],
+  "dataDirectory": "default/57/dc/dc57b9491a1049eba4c8af47cf1b9f25",
+  "relation": {
+    "kind": "Relation",
+    "id": "107bac1e-86cd-4efd-8866-433ca44c569e"
+  },
+  "size": 0,
+  "storageSize": 14504.0,
+  "queryHash": "bb3c9ef2-f53d-4656-9c9f-a90acc537e56",
+  "queryTableType": "column",
+  "query": {
+    "kind": "CubeQuery",
+    "relation": {
+      "kind": "Relation",
+      "id": "71f3ae8a-b867-45c9-b33c-c700533ecad0"
+    },
+    "colColumns": [],
+    "rowColumns": [],
+    "axisQueries": [],
+    "filters": {
+      "kind": "Filters",
+      "removeNaN": true,
+      "namedFilters": []
+    },
+    "operatorSettings": {
+      "kind": "OperatorSettings",
+      "namespace": "",
+      "operatorRef": {
+        "kind": "OperatorRef",
+        "name": "",
+        "version": "",
+        "operatorId": "",
+        "operatorKind": "",
+        "propertyValues": [],
+        "url": {
+          "kind": "Url",
+          "uri": ""
+        },
+        "operatorSpec": {
+          "kind": "OperatorSpec",
+          "ontologyUri": "",
+          "ontologyVersion": "",
+          "inputSpecs": [],
+          "outputSpecs": [],
+          "outputSpecsV2": []
+        }
+      },
+      "environment": [],
+      "operatorModel": {
+        "kind": "OperatorModel"
+      }
+    },
+    "qtHash": "",
+    "columnHash": "",
+    "rowHash": ""
+  }
+}

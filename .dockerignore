@@ -4,3 +4,4 @@ target/
 .dockerignore
 *.md
 .github/
+tests/

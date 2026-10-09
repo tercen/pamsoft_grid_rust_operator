@@ -61,12 +61,12 @@ jobs:
           docker push pamgene/pamsoft_grid_rust_operator:${TERCEN_MAJOR}.${TERCEN_MINOR}.${TERCEN_PATCH}
         if: env.TERCEN_PATCH != ''
 
-  # Integration test against a live Tercen instance. Disabled while the
-  # operator is still stubs — tercenctl can't download a private repo
-  # without the TERCEN_GITHUB_TOKEN secret anyway. Re-enable by removing
-  # `if: false` once the repo is public or a PAT with read access is set.
+  # Install-check against the stage instance on main: build-docker has just
+  # pushed :latest (operator.json on main points at it), so this installs
+  # this commit's image and runs tests/. Not run on pull requests — there
+  # :latest is still the previous main build.
   build:
-    if: false
+    if: github.event_name == 'push'
     needs: build-docker
     runs-on: ubuntu-latest
     steps:
@@ -79,5 +79,5 @@ jobs:
           -e TERCEN_USERNAME=${{ secrets.TERCEN_TEST_OPERATOR_USERNAME }} \
           -e TERCEN_PASSWORD=${{ secrets.TERCEN_TEST_OPERATOR_PASSWORD }} \
           -e TERCEN_URI=${{ secrets.TERCEN_TEST_OPERATOR_URI }} \
-          -e GITHUB_TOKEN=${{ secrets.TERCEN_GITHUB_TOKEN }} \
+          -e GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
           tercen/tercenctl:release operator install --rm --tag ${GITHUB_SHA} --repo ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
