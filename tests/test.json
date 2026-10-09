@@ -4,7 +4,7 @@
   "namespace": "ds0",
   "inputFileUris": ["ptk_grid_test_images.zip"],
   "inputDataUri": "ptk_grid_test_input.csv",
-  "outputDataUri": ["ptk_grid_test_out_1.csv"],
+  "outputDataUri": ["ptk_grid_test_out_1.csv", "ptk_grid_test_out_2.csv"],
   "columns": ["documentId", "Barcode", "Array"],
   "rows": [],
   "colors": [],
