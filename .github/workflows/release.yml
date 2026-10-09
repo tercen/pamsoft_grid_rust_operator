@@ -65,20 +65,18 @@ jobs:
         git commit -m "release $TAG: pin operator.json to $DOCKER_IMAGE:$TAG [skip ci]"
         git tag -f "$TAG"
         git push -f origin "refs/tags/$TAG"
-    # Integration test against a live Tercen instance. Disabled while the
-    # operator is still stubs; re-enable once the repo is public or a PAT
-    # with read access is wired as TERCEN_GITHUB_TOKEN.
+    # Install-check against the stage instance: installs the pinned tag and
+    # runs tests/ (golden PTK test). Fatal by design — a red check must stop
+    # the release before it is listed.
     - name: Pull tercenctl
-      if: false
       run: docker pull tercen/tercenctl:release
     - name: Install operator
-      if: false
       run: |
         docker run --rm \
           -e TERCEN_USERNAME=${{ secrets.TERCEN_TEST_OPERATOR_USERNAME }} \
           -e TERCEN_PASSWORD=${{ secrets.TERCEN_TEST_OPERATOR_PASSWORD }} \
           -e TERCEN_URI=${{ secrets.TERCEN_TEST_OPERATOR_URI }} \
-          -e GITHUB_TOKEN=${{ secrets.TERCEN_GITHUB_TOKEN }} \
+          -e GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
           tercen/tercenctl:release operator install --rm --tag ${TAG} --repo ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
     - name: Create required package.json
       run: echo '{}' > package.json
