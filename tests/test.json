@@ -9,7 +9,7 @@
   "rows": [],
   "colors": [],
   "labels": ["Image"],
-  "yAxis": "",
+  "yAxis": "Cycle",
   "xAxis": "",
   "equalityMethod": "R2",
   "r2": 0.99
