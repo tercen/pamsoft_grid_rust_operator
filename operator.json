@@ -1,11 +1,18 @@
 {
   "name": "pamsoft_grid_rust_operator",
   "description": "PamSoft grid detection + segmentation operator. Rust port of the original MATLAB MCR implementation.",
-  "tags": ["image analysis"],
+  "tags": [
+    "image analysis"
+  ],
   "communicationProtocol": "grpc",
-  "authors": ["Tercen", "Thiago"],
-  "urls": ["https://github.com/tercen/pamsoft_grid_rust_operator"],
-  "container": "pamgene/pamsoft_grid_rust_operator:latest",
+  "authors": [
+    "Tercen",
+    "Thiago"
+  ],
+  "urls": [
+    "https://github.com/tercen/pamsoft_grid_rust_operator"
+  ],
+  "container": "pamgene/pamsoft_grid_rust_operator:0.4.4",
   "properties": [
     {
       "kind": "DoubleProperty",
@@ -61,7 +68,10 @@
       "name": "Segmentation Method",
       "defaultValue": "Edge",
       "description": "Per-spot segmentation algorithm.",
-      "values": ["Edge", "Hough"]
+      "values": [
+        "Edge",
+        "Hough"
+      ]
     },
     {
       "kind": "StringProperty",
